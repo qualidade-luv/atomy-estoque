@@ -3,7 +3,8 @@ import streamlit as st
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, date
+import re
 
 # ============================================================
 # CONFIGURAÇÃO INICIAL
@@ -28,46 +29,28 @@ HEADERS_LOGIN = ["Login", "Senha"]
 MARKER_BEGIN = "-----BEGIN PRIVATE KEY-----"
 MARKER_END = "-----END PRIVATE KEY-----"
 
+DIAS_ALERTA_AMARELO = 15
+
 
 # ============================================================
 # SANEAMENTO DA PRIVATE_KEY
 # ============================================================
 def _sanitizar_private_key(pk: str) -> str:
-    """
-    Recebe a string da private_key (possivelmente corrompida) e devolve
-    uma chave PEM válida:
-      - Substitui '\\n' literais por quebras reais
-      - Remove qualquer lixo antes do BEGIN e depois do END
-      - Recompõe cabeçalho/rodapé em linhas próprias
-    """
     if not pk:
         raise ValueError("private_key vazia nos Secrets.")
-
-    # 1) Corrige \n literais que vêm do TOML/JSON escapado
     pk = pk.replace("\\n", "\n").replace("\r", "")
 
-    # 2) Localiza o cabeçalho e descarta o que vier antes
     idx_begin = pk.find(MARKER_BEGIN)
     if idx_begin == -1:
-        raise ValueError(
-            "Cabeçalho '-----BEGIN PRIVATE KEY-----' não encontrado. "
-            "Copie a chave exatamente do arquivo JSON da conta de serviço."
-        )
+        raise ValueError("Cabeçalho '-----BEGIN PRIVATE KEY-----' não encontrado.")
     pk = pk[idx_begin:]
 
-    # 3) Localiza o rodapé e descarta o que vier depois
     idx_end = pk.find(MARKER_END)
     if idx_end == -1:
-        raise ValueError(
-            "Rodapé '-----END PRIVATE KEY-----' não encontrado. "
-            "A chave parece estar truncada."
-        )
+        raise ValueError("Rodapé '-----END PRIVATE KEY-----' não encontrado.")
     pk = pk[: idx_end + len(MARKER_END)]
 
-    # 4) Remove espaços/tabs dentro das linhas (mantém quebras)
-    linhas = [linha.strip() for linha in pk.split("\n") if linha.strip()]
-
-    # 5) Garante BEGIN e END como primeira e última linhas
+    linhas = [l.strip() for l in pk.split("\n") if l.strip()]
     if linhas[0] != MARKER_BEGIN:
         linhas.insert(0, MARKER_BEGIN)
     if linhas[-1] != MARKER_END:
@@ -80,32 +63,18 @@ def _sanitizar_private_key(pk: str) -> str:
 # CONEXÃO COM GOOGLE SHEETS
 # ============================================================
 def _normalizar_credenciais() -> dict:
-    """
-    Lê st.secrets['gcp_service_account'] e devolve dict pronto para
-    Credentials.from_service_account_info.
-
-    Aceita:
-      1) String JSON  ->  gcp_service_account = '''{ ...json... }'''
-      2) Tabela TOML  ->  [gcp_service_account]  type = ...
-    """
     if "gcp_service_account" not in st.secrets:
-        raise ValueError(
-            "Secrets ausente: adicione 'gcp_service_account' (JSON-string ou tabela TOML)."
-        )
+        raise ValueError("Secrets ausente: adicione 'gcp_service_account'.")
 
     raw = st.secrets["gcp_service_account"]
-
     if isinstance(raw, str):
-        try:
-            creds_dict = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"JSON da conta de serviço inválido: {e}")
+        creds_dict = json.loads(raw)
     else:
         creds_dict = dict(raw)
 
     for campo in ("client_email", "token_uri", "private_key"):
         if not creds_dict.get(campo):
-            raise ValueError(f"Credencial incompleta: campo '{campo}' ausente.")
+            raise ValueError(f"Credencial incompleta: '{campo}' ausente.")
 
     creds_dict["private_key"] = _sanitizar_private_key(creds_dict["private_key"])
     return creds_dict
@@ -114,13 +83,7 @@ def _normalizar_credenciais() -> dict:
 @st.cache_resource(show_spinner="Conectando ao Google Sheets...")
 def get_gspread_client():
     creds_dict = _normalizar_credenciais()
-    try:
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    except Exception as e:
-        raise ValueError(
-            "Falha ao criar credenciais. Verifique a private_key nos Secrets. "
-            f"Detalhe: {e}"
-        )
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
@@ -137,27 +100,22 @@ def get_spreadsheet():
 
 
 def garantir_abas():
-    """Cria as abas 'Base' e 'Login' com cabeçalhos se não existirem."""
     sh = get_spreadsheet()
 
-    # ---- Base ----
     try:
         ws_base = sh.worksheet(ABA_BASE)
     except gspread.WorksheetNotFound:
         ws_base = sh.add_worksheet(title=ABA_BASE, rows=1000, cols=len(HEADERS_BASE))
         ws_base.append_row(HEADERS_BASE)
-
     if not ws_base.row_values(1):
         ws_base.insert_row(HEADERS_BASE, index=1)
 
-    # ---- Login ----
     try:
         ws_login = sh.worksheet(ABA_LOGIN)
     except gspread.WorksheetNotFound:
         ws_login = sh.add_worksheet(title=ABA_LOGIN, rows=100, cols=len(HEADERS_LOGIN))
         ws_login.append_row(HEADERS_LOGIN)
         ws_login.append_row(["admin", "admin123"])
-
     if not ws_login.row_values(1):
         ws_login.insert_row(HEADERS_LOGIN, index=1)
         ws_login.append_row(["admin", "admin123"])
@@ -166,7 +124,7 @@ def garantir_abas():
 
 
 # ============================================================
-# AUTENTICAÇÃO (CASE-INSENSITIVE)
+# AUTENTICAÇÃO
 # ============================================================
 def autenticar(login: str, senha: str) -> tuple[bool, str]:
     _, ws_login = garantir_abas()
@@ -210,7 +168,44 @@ def tela_login():
 
 
 # ============================================================
-# LEITURA E ESCRITA NA BASE
+# HELPERS NUMÉRICOS / DATA
+# ============================================================
+def _to_num(serie) -> pd.Series:
+    """Converte para numérico tolerando vírgula decimal e vazios."""
+    if isinstance(serie, pd.Series):
+        s = serie.astype(str).str.strip().str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        s = s.replace({"": None, "nan": None, "None": None})
+        return pd.to_numeric(s, errors="coerce").fillna(0)
+    try:
+        return float(str(serie).replace(".", "").replace(",", "."))
+    except Exception:
+        return 0.0
+
+
+def _parse_data(txt) -> date | None:
+    """Tenta interpretar a data em vários formatos comuns."""
+    if txt is None:
+        return None
+    s = str(txt).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _calc_dias_validade(txt) -> int | None:
+    d = _parse_data(txt)
+    if d is None:
+        return None
+    return (d - date.today()).days
+
+
+# ============================================================
+# LEITURA E ESCRITA
 # ============================================================
 def carregar_dados() -> pd.DataFrame:
     ws_base, _ = garantir_abas()
@@ -226,7 +221,6 @@ def carregar_dados() -> pd.DataFrame:
 
 
 def salvar_dados(df: pd.DataFrame, mensagem_sucesso: str = "Operação concluída."):
-    """Sobrescreve o conteúdo da aba Base (mantendo cabeçalhos)."""
     ws_base, _ = garantir_abas()
 
     if ws_base.row_count > 1:
@@ -241,6 +235,61 @@ def salvar_dados(df: pd.DataFrame, mensagem_sucesso: str = "Operação concluíd
     st.cache_data.clear()
     st.toast(mensagem_sucesso, icon="✅")
     st.rerun()
+
+
+# ============================================================
+# ESTILIZAÇÃO CONDICIONAL
+# ============================================================
+def _linha_abaixo_minimo(row) -> bool:
+    saldo = _to_num(row.get("SALDO", 0))
+    minimo = _to_num(row.get("ESTOQUE_MINIMO", 0))
+    return minimo > 0 and saldo < minimo
+
+
+def _linha_vencida(row) -> bool:
+    dias = row.get("_DIAS_VALIDADE")
+    return dias is not None and not pd.isna(dias) and dias < 0
+
+
+def _linha_amarela(row) -> bool:
+    dias = row.get("_DIAS_VALIDADE")
+    return (
+        dias is not None
+        and not pd.isna(dias)
+        and 0 <= dias <= DIAS_ALERTA_AMARELO
+    )
+
+
+def _estilo_linha(row):
+    """
+    Ordem de prioridade de cor:
+      1) Vermelho -> vencido (dias < 0)
+      2) Amarelo  -> faltam <= 15 dias
+      3) Laranja  -> saldo abaixo do mínimo
+    """
+    if _linha_vencida(row):
+        return ["background-color: #ff4d4d; color: white;"] * len(row)
+    if _linha_amarela(row):
+        return ["background-color: #fff3b0; color: #333;"] * len(row)
+    if _linha_abaixo_minimo(row):
+        return ["background-color: #ffb347; color: #222;"] * len(row)
+    return [""] * len(row)
+
+
+def preparar_df_exibicao(df: pd.DataFrame) -> pd.DataFrame:
+    """Adiciona colunas calculadas (sem gravar na planilha)."""
+    df_exib = df.copy()
+    df_exib["_DIAS_VALIDADE"] = df_exib["VALIDADE"].apply(_calc_dias_validade)
+
+    def _label(dias):
+        if dias is None or pd.isna(dias):
+            return "—"
+        if dias < 0:
+            return f"VENCIDO ({abs(dias)}d)"
+        return f"{dias} dias"
+
+    df_exib["VALIDADE_RESTANTE"] = df_exib["_DIAS_VALIDADE"].apply(_label)
+    return df_exib
 
 
 # ============================================================
@@ -260,25 +309,62 @@ def app_principal():
         st.error(f"Erro ao carregar dados: {e}")
         st.stop()
 
-    # ---- Indicadores ----
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total de Produtos", len(df))
-    try:
-        saldo = pd.to_numeric(df["SALDO"], errors="coerce")
-        minimo = pd.to_numeric(df["ESTOQUE_MINIMO"], errors="coerce")
-        abaixo = df[(saldo < minimo) & saldo.notna() & minimo.notna()]
-        c2.metric("Abaixo do Mínimo", len(abaixo))
-    except Exception:
-        c2.metric("Abaixo do Mínimo", "—")
-    c3.metric("Atualizado em", datetime.now().strftime("%d/%m/%Y %H:%M"))
+    # ---------- Indicadores ----------
+    df_calc = df.copy()
+    saldo = _to_num(df_calc["SALDO"])
+    minimo = _to_num(df_calc["ESTOQUE_MINIMO"])
+    abaixo_min = ((minimo > 0) & (saldo < minimo)).sum()
 
-    st.dataframe(df, use_container_width=True)
+    df_calc["_DIAS_VALIDADE"] = df_calc["VALIDADE"].apply(_calc_dias_validade)
+    vencidos = df_calc["_DIAS_VALIDADE"].apply(
+        lambda d: d is not None and not pd.isna(d) and d < 0
+    ).sum()
+    a_vencer = df_calc["_DIAS_VALIDADE"].apply(
+        lambda d: d is not None and not pd.isna(d) and 0 <= d <= DIAS_ALERTA_AMARELO
+    ).sum()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total de Produtos", len(df))
+    c2.metric("Abaixo do Mínimo", int(abaixo_min))
+    c3.metric("Vencidos", int(vencidos))
+    c4.metric("A vencer (≤15 dias)", int(a_vencer))
+
+    # ---------- Tabela estilizada ----------
+    st.subheader("📋 Estoque atual")
+    if df.empty:
+        st.info("Nenhum produto cadastrado ainda.")
+    else:
+        df_exib = preparar_df_exibicao(df)
+        colunas_exibir = HEADERS_BASE + ["VALIDADE_RESTANTE"]
+        df_view = df_exib[colunas_exibir + ["_DIAS_VALIDADE"]]
+
+        styled = (
+            df_view.style
+            .apply(_estilo_linha, axis=1)
+            .format({"_DIAS_VALIDADE": lambda v: "" if pd.isna(v) else int(v)})
+            .hide(axis="columns", subset=["_DIAS_VALIDADE"])
+        )
+        st.dataframe(styled, use_container_width=True)
+
+        legenda = (
+            "🟧 **Laranja**: saldo abaixo do estoque mínimo &nbsp;|&nbsp; "
+            "🟨 **Amarelo**: validade em até 15 dias &nbsp;|&nbsp; "
+            "🟥 **Vermelho**: produto vencido"
+        )
+        st.caption(legenda)
+
     st.divider()
 
-    # ---- CRUD ----
+    # ---------- CRUD ----------
     operacao = st.selectbox(
         "Selecione a operação:",
-        ["Adicionar Produto", "Editar Produto", "Excluir Produto"],
+        [
+            "Adicionar Produto",
+            "Editar Produto",
+            "Excluir Produto",
+            "Registrar Entrada",
+            "Registrar Saída",
+        ],
     )
 
     # ---------- ADICIONAR ----------
@@ -293,10 +379,17 @@ def app_principal():
                 "VALIDADE": c[3].text_input("Validade (DD/MM/AAAA)"),
             }
             c2 = st.columns(4)
-            novo["ENTRADAS"] = c2[0].text_input("Entradas")
-            novo["SAIDAS"] = c2[1].text_input("Saídas")
-            novo["SALDO"] = c2[2].text_input("Saldo")
-            novo["ESTOQUE_MINIMO"] = c2[3].text_input("Estoque mínimo")
+            novo["ENTRADAS"] = c2[0].text_input("Entradas", value="0")
+            novo["SAIDAS"] = c2[1].text_input("Saídas", value="0")
+            novo["ESTOQUE_MINIMO"] = c2[3].text_input("Estoque mínimo", value="0")
+
+            # SALDO é calculado automaticamente
+            estoque_ini = _to_num(novo["ESTOQUE"])
+            entradas = _to_num(novo["ENTRADAS"])
+            saidas = _to_num(novo["SAIDAS"])
+            novo["SALDO"] = str(int(estoque_ini + entradas - saidas))
+
+            st.info(f"Saldo calculado automaticamente: **{novo['SALDO']}**")
 
             confirmar = st.checkbox("Confirmo que desejo adicionar este produto.")
             submit = st.form_submit_button("Adicionar", use_container_width=True)
@@ -334,10 +427,16 @@ def app_principal():
                 c2 = st.columns(4)
                 editado["ENTRADAS"] = c2[0].text_input("Entradas", value=linha["ENTRADAS"])
                 editado["SAIDAS"] = c2[1].text_input("Saídas", value=linha["SAIDAS"])
-                editado["SALDO"] = c2[2].text_input("Saldo", value=linha["SALDO"])
                 editado["ESTOQUE_MINIMO"] = c2[3].text_input(
                     "Estoque mínimo", value=linha["ESTOQUE_MINIMO"]
                 )
+
+                # SALDO recalculado automaticamente
+                estoque_e = _to_num(editado["ESTOQUE"])
+                entradas_e = _to_num(editado["ENTRADAS"])
+                saidas_e = _to_num(editado["SAIDAS"])
+                editado["SALDO"] = str(int(estoque_e + entradas_e - saidas_e))
+                st.info(f"Saldo recalculado automaticamente: **{editado['SALDO']}**")
 
                 confirmar = st.checkbox("Confirmo que desejo salvar as alterações.")
                 submit = st.form_submit_button("Salvar Alterações", use_container_width=True)
@@ -356,7 +455,7 @@ def app_principal():
                             st.error(f"Erro ao salvar: {e}")
 
     # ---------- EXCLUIR ----------
-    else:
+    elif operacao == "Excluir Produto":
         st.subheader("🗑️ Excluir Produto")
         if df.empty:
             st.info("Nenhum produto cadastrado.")
@@ -373,6 +472,99 @@ def app_principal():
                         salvar_dados(df, "Produto excluído com sucesso.")
                     except Exception as e:
                         st.error(f"Erro ao excluir: {e}")
+
+    # ---------- REGISTRAR ENTRADA ----------
+    elif operacao == "Registrar Entrada":
+        st.subheader("📥 Registrar Entrada de Estoque")
+        if df.empty:
+            st.info("Cadastre um produto antes de registrar entradas.")
+        else:
+            produto = st.selectbox("Produto:", df["PRODUTO"].tolist())
+            idx = df.index[df["PRODUTO"] == produto][0]
+            saldo_atual = _to_num(df.at[idx, "SALDO"])
+
+            with st.form("form_entrada"):
+                qtd = st.number_input(
+                    "Quantidade a acrescentar:", min_value=1, step=1, value=1
+                )
+                st.write(f"Saldo atual: **{int(saldo_atual)}** → "
+                         f"Saldo após entrada: **{int(saldo_atual + qtd)}**")
+                confirmar = st.checkbox("Confirmo o registro desta ENTRADA.")
+                submit = st.form_submit_button("Registrar Entrada", use_container_width=True)
+
+                if submit:
+                    if not confirmar:
+                        st.warning("Confirmação obrigatória.")
+                    else:
+                        entradas_atuais = _to_num(df.at[idx, "ENTRADAS"])
+                        estoque_atual = _to_num(df.at[idx, "ESTOQUE"])
+                        saidas_atuais = _to_num(df.at[idx, "SAIDAS"])
+
+                        df.at[idx, "ENTRADAS"] = str(int(entradas_atuais + qtd))
+                        df.at[idx, "ESTOQUE"] = str(int(estoque_atual + qtd))
+                        df.at[idx, "SALDO"] = str(
+                            int(estoque_atual + qtd + entradas_atuais + qtd - saidas_atuais)
+                        )
+                        # Simplificação: SALDO = ESTOQUE + ENTRADAS - SAIDAS
+                        df.at[idx, "SALDO"] = str(
+                            int(
+                                _to_num(df.at[idx, "ESTOQUE"])
+                                + _to_num(df.at[idx, "ENTRADAS"])
+                                - _to_num(df.at[idx, "SAIDAS"])
+                            )
+                        )
+                        try:
+                            salvar_dados(df, f"Entrada de {int(qtd)} registrada.")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar: {e}")
+
+    # ---------- REGISTRAR SAÍDA ----------
+    elif operacao == "Registrar Saída":
+        st.subheader("📤 Registrar Saída de Estoque")
+        if df.empty:
+            st.info("Cadastre um produto antes de registrar saídas.")
+        else:
+            produto = st.selectbox("Produto:", df["PRODUTO"].tolist())
+            idx = df.index[df["PRODUTO"] == produto][0]
+            saldo_atual = _to_num(df.at[idx, "SALDO"])
+
+            with st.form("form_saida"):
+                qtd = st.number_input(
+                    "Quantidade a retirar:", min_value=1, step=1, value=1
+                )
+                novo_saldo = saldo_atual - qtd
+                if novo_saldo < 0:
+                    st.error(
+                        f"Saída maior que o saldo disponível ({int(saldo_atual)}). "
+                        "Ajuste a quantidade."
+                    )
+                st.write(f"Saldo atual: **{int(saldo_atual)}** → "
+                         f"Saldo após saída: **{int(novo_saldo)}**")
+                confirmar = st.checkbox("Confirmo o registro desta SAÍDA.")
+                submit = st.form_submit_button("Registrar Saída", use_container_width=True)
+
+                if submit:
+                    if not confirmar:
+                        st.warning("Confirmação obrigatória.")
+                    elif novo_saldo < 0:
+                        st.error("Saldo insuficiente. Operação cancelada.")
+                    else:
+                        saidas_atuais = _to_num(df.at[idx, "SAIDAS"])
+                        estoque_atual = _to_num(df.at[idx, "ESTOQUE"])
+
+                        df.at[idx, "SAIDAS"] = str(int(saidas_atuais + qtd))
+                        df.at[idx, "ESTOQUE"] = str(int(estoque_atual - qtd))
+                        df.at[idx, "SALDO"] = str(
+                            int(
+                                _to_num(df.at[idx, "ESTOQUE"])
+                                + _to_num(df.at[idx, "ENTRADAS"])
+                                - _to_num(df.at[idx, "SAIDAS"])
+                            )
+                        )
+                        try:
+                            salvar_dados(df, f"Saída de {int(qtd)} registrada.")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar: {e}")
 
 
 # ============================================================

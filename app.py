@@ -25,28 +25,76 @@ HEADERS_BASE = [
 ]
 HEADERS_LOGIN = ["Login", "Senha"]
 
+MARKER_BEGIN = "-----BEGIN PRIVATE KEY-----"
+MARKER_END = "-----END PRIVATE KEY-----"
+
+
+# ============================================================
+# SANEAMENTO DA PRIVATE_KEY
+# ============================================================
+def _sanitizar_private_key(pk: str) -> str:
+    """
+    Recebe a string da private_key (possivelmente corrompida) e devolve
+    uma chave PEM válida:
+      - Substitui '\\n' literais por quebras reais
+      - Remove qualquer lixo antes do BEGIN e depois do END
+      - Recompõe cabeçalho/rodapé em linhas próprias
+    """
+    if not pk:
+        raise ValueError("private_key vazia nos Secrets.")
+
+    # 1) Corrige \n literais que vêm do TOML/JSON escapado
+    pk = pk.replace("\\n", "\n").replace("\r", "")
+
+    # 2) Localiza o cabeçalho e descarta o que vier antes
+    idx_begin = pk.find(MARKER_BEGIN)
+    if idx_begin == -1:
+        raise ValueError(
+            "Cabeçalho '-----BEGIN PRIVATE KEY-----' não encontrado. "
+            "Copie a chave exatamente do arquivo JSON da conta de serviço."
+        )
+    pk = pk[idx_begin:]
+
+    # 3) Localiza o rodapé e descarta o que vier depois
+    idx_end = pk.find(MARKER_END)
+    if idx_end == -1:
+        raise ValueError(
+            "Rodapé '-----END PRIVATE KEY-----' não encontrado. "
+            "A chave parece estar truncada."
+        )
+    pk = pk[: idx_end + len(MARKER_END)]
+
+    # 4) Remove espaços/tabs dentro das linhas (mantém quebras)
+    linhas = [linha.strip() for linha in pk.split("\n") if linha.strip()]
+
+    # 5) Garante BEGIN e END como primeira e última linhas
+    if linhas[0] != MARKER_BEGIN:
+        linhas.insert(0, MARKER_BEGIN)
+    if linhas[-1] != MARKER_END:
+        linhas.append(MARKER_END)
+
+    return "\n".join(linhas) + "\n"
+
 
 # ============================================================
 # CONEXÃO COM GOOGLE SHEETS
 # ============================================================
-def _normalizar_credenciais():
+def _normalizar_credenciais() -> dict:
     """
-    Lê st.secrets['gcp_service_account'] e devolve um dict pronto
-    para Credentials.from_service_account_info.
+    Lê st.secrets['gcp_service_account'] e devolve dict pronto para
+    Credentials.from_service_account_info.
 
-    Aceita dois formatos no secrets.toml:
-      1) Tabela TOML  ->  [gcp_service_account]  type = ...  private_key = "..."
-      2) String JSON  ->  gcp_service_account = '''{ ...json... }'''
+    Aceita:
+      1) String JSON  ->  gcp_service_account = '''{ ...json... }'''
+      2) Tabela TOML  ->  [gcp_service_account]  type = ...
     """
     if "gcp_service_account" not in st.secrets:
         raise ValueError(
-            "Secrets ausente: adicione a seção [gcp_service_account] "
-            "ou a chave gcp_service_account com o JSON da conta de serviço."
+            "Secrets ausente: adicione 'gcp_service_account' (JSON-string ou tabela TOML)."
         )
 
     raw = st.secrets["gcp_service_account"]
 
-    # Caso 1: veio como string JSON
     if isinstance(raw, str):
         try:
             creds_dict = json.loads(raw)
@@ -55,30 +103,11 @@ def _normalizar_credenciais():
     else:
         creds_dict = dict(raw)
 
-    # Validação mínima dos campos exigidos pelo google-auth
     for campo in ("client_email", "token_uri", "private_key"):
         if not creds_dict.get(campo):
             raise ValueError(f"Credencial incompleta: campo '{campo}' ausente.")
 
-    # ---- Correção da private_key -----------------------------------------
-    # No TOML/Streamlit Cloud a chave costuma vir com "\n" literais
-    # (barra invertida + n) em vez de quebras de linha reais.
-    pk = creds_dict["private_key"]
-    # Substitui a sequência literal \n por quebra real
-    pk = pk.replace("\\n", "\n")
-    # Remove espaços/quebras extras que alguns editores inserem no início/fim
-    pk = pk.strip()
-    # Garante o header/footer PEM
-    if not pk.startswith("-----BEGIN PRIVATE KEY-----"):
-        raise ValueError(
-            "private_key inválida: não começa com '-----BEGIN PRIVATE KEY-----'. "
-            "Copie o valor exatamente do arquivo JSON da conta de serviço."
-        )
-    if not pk.endswith("-----END PRIVATE KEY-----"):
-        # Alguns JSONs vêm com \n final; normalizamos
-        pk = pk.rstrip() + "\n-----END PRIVATE KEY-----\n"
-    creds_dict["private_key"] = pk
-
+    creds_dict["private_key"] = _sanitizar_private_key(creds_dict["private_key"])
     return creds_dict
 
 
@@ -89,8 +118,8 @@ def get_gspread_client():
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     except Exception as e:
         raise ValueError(
-            "Falha ao criar credenciais. Verifique se a private_key foi colada "
-            f"corretamente nos Secrets. Detalhe: {e}"
+            "Falha ao criar credenciais. Verifique a private_key nos Secrets. "
+            f"Detalhe: {e}"
         )
     return gspread.authorize(creds)
 
@@ -102,8 +131,8 @@ def get_spreadsheet():
         return client.open_by_key(SPREADSHEET_ID)
     except gspread.SpreadsheetNotFound:
         raise ValueError(
-            "Planilha não encontrada ou sem permissão. "
-            "Compartilhe a planilha como Editor com o client_email da conta de serviço."
+            "Planilha não encontrada ou sem permissão. Compartilhe como Editor "
+            "com o client_email da conta de serviço."
         )
 
 
@@ -111,33 +140,25 @@ def garantir_abas():
     """Cria as abas 'Base' e 'Login' com cabeçalhos se não existirem."""
     sh = get_spreadsheet()
 
-    # ---- Aba Base ----
+    # ---- Base ----
     try:
         ws_base = sh.worksheet(ABA_BASE)
     except gspread.WorksheetNotFound:
-        ws_base = sh.add_worksheet(
-            title=ABA_BASE, rows=1000, cols=len(HEADERS_BASE)
-        )
+        ws_base = sh.add_worksheet(title=ABA_BASE, rows=1000, cols=len(HEADERS_BASE))
         ws_base.append_row(HEADERS_BASE)
 
-    # Se a aba existe mas está vazia, escreve cabeçalhos
-    valores_base = ws_base.row_values(1)
-    if not valores_base:
+    if not ws_base.row_values(1):
         ws_base.insert_row(HEADERS_BASE, index=1)
 
-    # ---- Aba Login ----
+    # ---- Login ----
     try:
         ws_login = sh.worksheet(ABA_LOGIN)
     except gspread.WorksheetNotFound:
-        ws_login = sh.add_worksheet(
-            title=ABA_LOGIN, rows=100, cols=len(HEADERS_LOGIN)
-        )
+        ws_login = sh.add_worksheet(title=ABA_LOGIN, rows=100, cols=len(HEADERS_LOGIN))
         ws_login.append_row(HEADERS_LOGIN)
-        # Usuário padrão para primeiro acesso
         ws_login.append_row(["admin", "admin123"])
 
-    valores_login = ws_login.row_values(1)
-    if not valores_login:
+    if not ws_login.row_values(1):
         ws_login.insert_row(HEADERS_LOGIN, index=1)
         ws_login.append_row(["admin", "admin123"])
 
@@ -157,7 +178,7 @@ def autenticar(login: str, senha: str) -> tuple[bool, str]:
     for reg in registros:
         user = str(reg.get("Login", "")).strip().lower()
         pwd = str(reg.get("Senha", "")).strip().lower()
-        if user == login_norm and pwd == senha_norm and user != "":
+        if user and user == login_norm and pwd == senha_norm:
             return True, login
     return False, "Login ou senha inválidos."
 
@@ -201,7 +222,6 @@ def carregar_dados() -> pd.DataFrame:
     for col in HEADERS_BASE:
         if col not in df.columns:
             df[col] = ""
-    # Mantém apenas as colunas oficiais e na ordem
     return df[HEADERS_BASE].astype(str)
 
 
@@ -209,7 +229,6 @@ def salvar_dados(df: pd.DataFrame, mensagem_sucesso: str = "Operação concluíd
     """Sobrescreve o conteúdo da aba Base (mantendo cabeçalhos)."""
     ws_base, _ = garantir_abas()
 
-    # Limpa dados antigos a partir da linha 2
     if ws_base.row_count > 1:
         ws_base.batch_clear(
             [f"A2:{gspread.utils.rowcol_to_a1(ws_base.row_count, len(HEADERS_BASE))}"]
@@ -219,7 +238,6 @@ def salvar_dados(df: pd.DataFrame, mensagem_sucesso: str = "Operação concluíd
         valores = df[HEADERS_BASE].astype(str).values.tolist()
         ws_base.update(valores, "A2", value_input_option="USER_ENTERED")
 
-    # Invalida caches e recarrega
     st.cache_data.clear()
     st.toast(mensagem_sucesso, icon="✅")
     st.rerun()
@@ -229,7 +247,6 @@ def salvar_dados(df: pd.DataFrame, mensagem_sucesso: str = "Operação concluíd
 # INTERFACE PRINCIPAL
 # ============================================================
 def app_principal():
-    # ---- Sidebar ----
     st.sidebar.success(f"👤 {st.session_state.get('usuario', '')}")
     if st.sidebar.button("Sair", use_container_width=True):
         st.session_state.clear()

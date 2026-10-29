@@ -34,22 +34,17 @@ DIAS_ALERTA_AMARELO = 15
 # SANEAMENTO DA PRIVATE_KEY
 # ============================================================
 def _sanitizar_private_key(pk: str) -> str:
-    if not pk:
-        raise ValueError("private_key vazia nos Secrets.")
+    if not pk: raise ValueError("private_key vazia nos Secrets.")
     pk = pk.replace("\\n", "\n").replace("\r", "")
     idx_begin = pk.find(MARKER_BEGIN)
-    if idx_begin == -1:
-        raise ValueError("Cabeçalho '-----BEGIN PRIVATE KEY-----' não encontrado.")
+    if idx_begin == -1: raise ValueError("Cabeçalho PEM não encontrado.")
     pk = pk[idx_begin:]
     idx_end = pk.find(MARKER_END)
-    if idx_end == -1:
-        raise ValueError("Rodapé '-----END PRIVATE KEY-----' não encontrado.")
+    if idx_end == -1: raise ValueError("Rodapé PEM não encontrado.")
     pk = pk[: idx_end + len(MARKER_END)]
     linhas = [l.strip() for l in pk.split("\n") if l.strip()]
-    if linhas[0] != MARKER_BEGIN:
-        linhas.insert(0, MARKER_BEGIN)
-    if linhas[-1] != MARKER_END:
-        linhas.append(MARKER_END)
+    if linhas[0] != MARKER_BEGIN: linhas.insert(0, MARKER_BEGIN)
+    if linhas[-1] != MARKER_END: linhas.append(MARKER_END)
     return "\n".join(linhas) + "\n"
 
 # ============================================================
@@ -59,13 +54,10 @@ def _normalizar_credenciais() -> dict:
     if "gcp_service_account" not in st.secrets:
         raise ValueError("Secrets ausente: adicione 'gcp_service_account'.")
     raw = st.secrets["gcp_service_account"]
-    if isinstance(raw, str):
-        creds_dict = json.loads(raw)
-    else:
-        creds_dict = dict(raw)
+    if isinstance(raw, str): creds_dict = json.loads(raw)
+    else: creds_dict = dict(raw)
     for campo in ("client_email", "token_uri", "private_key"):
-        if not creds_dict.get(campo):
-            raise ValueError(f"Credencial incompleta: '{campo}' ausente.")
+        if not creds_dict.get(campo): raise ValueError(f"Credencial incompleta: '{campo}' ausente.")
     creds_dict["private_key"] = _sanitizar_private_key(creds_dict["private_key"])
     return creds_dict
 
@@ -78,10 +70,8 @@ def get_gspread_client():
 @st.cache_resource(show_spinner="Abrindo planilha...")
 def get_spreadsheet():
     client = get_gspread_client()
-    try:
-        return client.open_by_key(SPREADSHEET_ID)
-    except gspread.SpreadsheetNotFound:
-        raise ValueError("Planilha não encontrada ou sem permissão.")
+    try: return client.open_by_key(SPREADSHEET_ID)
+    except gspread.SpreadsheetNotFound: raise ValueError("Planilha não encontrada ou sem permissão.")
 
 def garantir_abas():
     sh = get_spreadsheet()
@@ -90,9 +80,7 @@ def garantir_abas():
     except gspread.WorksheetNotFound:
         ws_base = sh.add_worksheet(title=ABA_BASE, rows=1000, cols=len(HEADERS_BASE))
         ws_base.append_row(HEADERS_BASE)
-    if not ws_base.row_values(1):
-        ws_base.insert_row(HEADERS_BASE, index=1)
-
+    if not ws_base.row_values(1): ws_base.insert_row(HEADERS_BASE, index=1)
     try:
         ws_login = sh.worksheet(ABA_LOGIN)
     except gspread.WorksheetNotFound:
@@ -102,7 +90,6 @@ def garantir_abas():
     if not ws_login.row_values(1):
         ws_login.insert_row(HEADERS_LOGIN, index=1)
         ws_login.append_row(["admin", "admin123"])
-
     return ws_base, ws_login
 
 # ============================================================
@@ -160,12 +147,14 @@ def _parse_data(txt) -> date | None:
     if txt is None: return None
     s = str(txt).strip()
     if not s or s.lower() in ("nan", "none", ""): return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
+    
+    # Usa pd.to_datetime para ser mais tolerante a formatos e erros
+    try:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(dt): return None
+        return dt.date()
+    except Exception:
+        return None
 
 def _calc_dias_validade(txt) -> int | None:
     d = _parse_data(txt)
